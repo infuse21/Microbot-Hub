@@ -28,7 +28,8 @@ public class PrifddinasCourse implements AgilityCourseHandler
 		ObjectID.PRIF_AGILITY_SHORTCUT_PORTAL_6
 	);
 
-	private final WorldPoint fallRecoveryPoint = new WorldPoint(3254, 6108, 0);
+	private static final int START_RECOVERY_DISTANCE = 2;
+	private static final int START_REGION_RECOVERY_RADIUS = 80;
 	private double lastKnownHealth = -1;
 
 	@Override
@@ -102,14 +103,16 @@ public class PrifddinasCourse implements AgilityCourseHandler
 			WorldPoint playerLocation = getPlayerWorldLocation();
 			log.info("Player location when fall detected: {}", playerLocation);
 
-			// walk to exact fall recovery point
-			log.info("Walking to exact fall recovery point: {}", fallRecoveryPoint);
-			Rs2Walker.walkTo(fallRecoveryPoint, 0);
-			Microbot.log("Fell from agility course, walking back to start");
+			if (isInStartRecoveryRegion(playerLocation))
+			{
+				log.info("Walking back to Prifddinas agility start: {}", getStartPoint());
+				Rs2Walker.walkTo(getStartPoint(), START_RECOVERY_DISTANCE);
+				Microbot.log("Fell from agility course, walking back to start");
+			}
 
 			// update health tracking
 			lastKnownHealth = currentHealth;
-			return true;
+			return isInStartRecoveryRegion(playerLocation);
 		}
 
 		// update health tracking (health stayed same or increased due to healing)
@@ -160,7 +163,44 @@ public class PrifddinasCourse implements AgilityCourseHandler
 			return true;
 		}
 
+		if (isInStartRecoveryRegion(playerWorldLocation) && AgilityCourseHandler.super.handleWalkToStart(playerWorldLocation))
+		{
+			return true;
+		}
+
 		log.debug("PrifddinasCourse.handleWalkToStart() returning false");
 		return false;
+	}
+
+	@Override
+	public boolean recoverFromMissingObstacle(WorldPoint playerWorldLocation)
+	{
+		if (playerWorldLocation == null)
+		{
+			return false;
+		}
+
+		if (getClientPlane() != 0)
+		{
+			return false;
+		}
+
+		int distanceToStart = playerWorldLocation.distanceTo(getStartPoint());
+		if (distanceToStart > START_RECOVERY_DISTANCE && isInStartRecoveryRegion(playerWorldLocation))
+		{
+			log.info("Recovering Prifddinas agility by walking back to start from {}", playerWorldLocation);
+			Microbot.log("Recovering Prifddinas agility, walking back to start");
+			Rs2Walker.walkTo(getStartPoint(), START_RECOVERY_DISTANCE);
+			return true;
+		}
+
+		return false;
+	}
+
+	private boolean isInStartRecoveryRegion(WorldPoint playerWorldLocation)
+	{
+		return playerWorldLocation != null
+			&& playerWorldLocation.getPlane() == getStartPoint().getPlane()
+			&& playerWorldLocation.distanceTo(getStartPoint()) <= START_REGION_RECOVERY_RADIUS;
 	}
 }

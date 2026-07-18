@@ -51,11 +51,20 @@ public class AgilityScript extends Script
 	private static final long MAIN_LOOP_DELAY_MS = 250;
 	private static final long MARK_OF_GRACE_SCAN_INTERVAL_MS = 750;
 	private static final int MARK_OF_GRACE_SEARCH_DISTANCE = 30;
+	private static final int MARK_OF_GRACE_LOCAL_PICKUP_DISTANCE = 3;
+	private static final int MARK_OF_GRACE_REACHABLE_PICKUP_DISTANCE = 12;
 	private static final int MARK_OF_GRACE_PICKUP_TIMEOUT = 5000;
+	private static final long MARK_OF_GRACE_FAILED_RETRY_COOLDOWN_MS = 10000;
+	private static final int MISSING_OBSTACLE_RECOVERY_THRESHOLD = 8;
+	private static final long MISSING_OBSTACLE_RECOVERY_COOLDOWN_MS = 5000;
 	private volatile int currentObstacleIndex = -1;
+	private int missingObstacleCount = 0;
+	private long lastMissingObstacleRecoveryAt = 0;
 	private WorldPoint pendingMarkOfGraceLocation = null;
 	private int pendingMarkOfGraceCount = 0;
 	private long pendingMarkOfGraceStartedAt = 0;
+	private WorldPoint skippedMarkOfGraceLocation = null;
+	private long skippedMarkOfGraceUntil = 0;
 	private long lastMarkOfGraceScanAt = 0;
 	private WorldPoint alchDecisionObstacleLocation = null;
 	private int alchDecisionObstacleId = -1;
@@ -85,6 +94,9 @@ public class AgilityScript extends Script
 		startPoint = null;
 		initialPlayerLocation = null;
 		currentObstacleIndex = -1;
+		missingObstacleCount = 0;
+		lastMissingObstacleRecoveryAt = 0;
+		clearSkippedMarkOfGrace();
 		supplyManager.reset();
 		clearPendingMarkOfGrace();
 		clearAlchDecision();
@@ -138,7 +150,11 @@ public class AgilityScript extends Script
 					return;
 				}
 				AgilityCourseHandler courseHandler = getActiveHandler();
-				final WorldPoint playerWorldLocation = Microbot.getClientThread().invoke(() -> Microbot.getClient().getLocalPlayer().getWorldLocation());
+				final WorldPoint playerWorldLocation = courseHandler.getPlayerWorldLocation();
+				if (playerWorldLocation == null)
+				{
+					return;
+				}
 
 				if (startPoint == null)
 				{
@@ -218,9 +234,10 @@ public class AgilityScript extends Script
 
 				if (gameObject == null)
 				{
-					Microbot.log("No agility obstacle found. Report this as a bug if this keeps happening.");
+					handleMissingObstacle(courseHandler, playerWorldLocation);
 					return;
 				}
+				missingObstacleCount = 0;
 
 				if (!Rs2Camera.isTileOnScreen(gameObject))
 				{
@@ -291,8 +308,12 @@ public class AgilityScript extends Script
 				// Normal obstacle interaction
 				if (interactWithObstacle(gameObject)) {
 					// Wait for completion - this now returns quickly on XP drop
-					boolean completed = courseHandler.waitForCompletion(agilityExp,
-						Microbot.getClientThread().invoke(() -> Microbot.getClient().getLocalPlayer().getWorldLocation()).getPlane());
+					WorldPoint completionLocation = courseHandler.getPlayerWorldLocation();
+					if (completionLocation == null)
+					{
+						return;
+					}
+					boolean completed = courseHandler.waitForCompletion(agilityExp, completionLocation.getPlane());
 					
 					if (!completed) {
 						// Timeout occurred - log warning (throttled to once per 30 seconds)
@@ -415,10 +436,46 @@ public class AgilityScript extends Script
 			startPoint = activeHandler.getStartPoint();
 			lastAgilityXp = Microbot.getClient().getSkillExperience(Skill.AGILITY);
 			currentObstacleIndex = -1;
+			missingObstacleCount = 0;
+			lastMissingObstacleRecoveryAt = 0;
+			clearSkippedMarkOfGrace();
 			supplyManager.reset();
 			clearAlchDecision();
 		}
 		return activeHandler;
+	}
+
+	private void handleMissingObstacle(AgilityCourseHandler courseHandler, WorldPoint playerWorldLocation)
+	{
+		if (Rs2Player.isMoving() || Rs2Player.isAnimating())
+		{
+			missingObstacleCount = 0;
+			return;
+		}
+
+		missingObstacleCount++;
+		long now = System.currentTimeMillis();
+		if (missingObstacleCount < MISSING_OBSTACLE_RECOVERY_THRESHOLD)
+		{
+			if (now - lastTimeoutWarning > 30000)
+			{
+				Microbot.log("No agility obstacle found near " + playerWorldLocation + ". Waiting for course state to settle.");
+				lastTimeoutWarning = now;
+			}
+			return;
+		}
+
+		if (now - lastMissingObstacleRecoveryAt < MISSING_OBSTACLE_RECOVERY_COOLDOWN_MS)
+		{
+			return;
+		}
+
+		lastMissingObstacleRecoveryAt = now;
+		Microbot.log("No agility obstacle found near " + playerWorldLocation + ". Attempting course recovery.");
+		if (courseHandler.recoverFromMissingObstacle(playerWorldLocation))
+		{
+			missingObstacleCount = 0;
+		}
 	}
 
 	private boolean lootMarksOfGrace(AgilityCourseHandler courseHandler)
@@ -431,12 +488,18 @@ public class AgilityScript extends Script
 
 		if (pendingMarkOfGraceLocation != null)
 		{
-			if (markPickupResolved() || System.currentTimeMillis() - pendingMarkOfGraceStartedAt > MARK_OF_GRACE_PICKUP_TIMEOUT)
+			if (markPickupResolved())
 			{
 				clearPendingMarkOfGrace();
 			}
 			else if (Rs2Player.isMoving() || Rs2Player.isAnimating())
 			{
+				if (System.currentTimeMillis() - pendingMarkOfGraceStartedAt > MARK_OF_GRACE_PICKUP_TIMEOUT)
+				{
+					deferMarkOfGrace(pendingMarkOfGraceLocation);
+					clearPendingMarkOfGrace();
+					return false;
+				}
 				return true;
 			}
 			else
@@ -467,9 +530,7 @@ public class AgilityScript extends Script
 			.fromWorldView()
 			.withId(ItemID.GRACE)
 			.where(Rs2TileItemModel::isLootAble)
-			.where(item -> item.getWorldLocation() != null && item.getWorldLocation().getPlane() == playerLocation.getPlane())
-			.where(item -> item.getWorldLocation().distanceTo(playerLocation) <= MARK_OF_GRACE_SEARCH_DISTANCE)
-			.where(item -> Rs2Walker.canReach(item.getWorldLocation()))
+			.where(item -> isLootableMarkCandidate(item, playerLocation))
 			.toList()
 			.stream()
 			.min(Comparator.comparingInt(item -> item.getWorldLocation().distanceTo(playerLocation)))
@@ -492,8 +553,18 @@ public class AgilityScript extends Script
 			return false;
 		}
 
+		int markDistance = markLocation.distanceTo(playerLocation);
+		boolean reachableMark = Rs2Walker.canReach(markLocation);
 		if (!Rs2Camera.isTileOnScreen(markLocalLocation))
 		{
+			if (reachableMark
+				&& markDistance > MARK_OF_GRACE_LOCAL_PICKUP_DISTANCE
+				&& Rs2Walker.walkMiniMap(markLocation))
+			{
+				sleepUntil(() -> shuttingDown || Rs2Player.isMoving(), 1200);
+				return true;
+			}
+
 			Rs2Camera.turnTo(markLocalLocation);
 			sleep(300, 600);
 			return true;
@@ -502,6 +573,11 @@ public class AgilityScript extends Script
 		int markCount = Rs2Inventory.itemQuantity(ItemID.GRACE);
 		if (!pickupMarkOfGrace(markOfGrace))
 		{
+			if (reachableMark && markDistance > 1 && Rs2Walker.walkMiniMap(markLocation))
+			{
+				sleepUntil(() -> shuttingDown || Rs2Player.isMoving(), 1200);
+				return true;
+			}
 			return false;
 		}
 		pendingMarkOfGraceLocation = markLocation;
@@ -513,7 +589,62 @@ public class AgilityScript extends Script
 		{
 			clearPendingMarkOfGrace();
 		}
+		else if (!Rs2Player.isMoving() && !Rs2Player.isAnimating())
+		{
+			deferMarkOfGrace(markLocation);
+			clearPendingMarkOfGrace();
+		}
 		return true;
+	}
+
+	private boolean isLootableMarkCandidate(Rs2TileItemModel item, WorldPoint playerLocation)
+	{
+		WorldPoint markLocation = item.getWorldLocation();
+		if (markLocation == null || markLocation.getPlane() != playerLocation.getPlane())
+		{
+			return false;
+		}
+
+		int distance = markLocation.distanceTo(playerLocation);
+		if (isSkippedMarkOfGrace(markLocation))
+		{
+			return false;
+		}
+
+		if (distance > MARK_OF_GRACE_SEARCH_DISTANCE)
+		{
+			return false;
+		}
+
+		if (distance <= MARK_OF_GRACE_LOCAL_PICKUP_DISTANCE)
+		{
+			return true;
+		}
+
+		return distance <= MARK_OF_GRACE_REACHABLE_PICKUP_DISTANCE && Rs2Walker.canReach(markLocation);
+	}
+
+	private boolean isSkippedMarkOfGrace(WorldPoint markLocation)
+	{
+		if (skippedMarkOfGraceLocation == null || System.currentTimeMillis() >= skippedMarkOfGraceUntil)
+		{
+			clearSkippedMarkOfGrace();
+			return false;
+		}
+
+		return skippedMarkOfGraceLocation.equals(markLocation);
+	}
+
+	private void deferMarkOfGrace(WorldPoint markLocation)
+	{
+		skippedMarkOfGraceLocation = markLocation;
+		skippedMarkOfGraceUntil = System.currentTimeMillis() + MARK_OF_GRACE_FAILED_RETRY_COOLDOWN_MS;
+	}
+
+	private void clearSkippedMarkOfGrace()
+	{
+		skippedMarkOfGraceLocation = null;
+		skippedMarkOfGraceUntil = 0;
 	}
 
 	private boolean markPickupResolved()
@@ -649,7 +780,11 @@ public class AgilityScript extends Script
 
 	private boolean performEfficientAlch(TileObject gameObject, String alchItem, int agilityExp)
 	{
-		WorldPoint playerLocation = Microbot.getClientThread().invoke(() -> Microbot.getClient().getLocalPlayer().getWorldLocation());
+		WorldPoint playerLocation = Rs2Player.getWorldLocation();
+		if (playerLocation == null)
+		{
+			return false;
+		}
 
 		if (gameObject.getWorldLocation().distanceTo(playerLocation) >= 5)
 		{
@@ -660,7 +795,7 @@ public class AgilityScript extends Script
 				Rs2Magic.alch(alchItem, 50, 75);
 				interactWithObstacle(gameObject);
 				boolean completed = getActiveHandler().waitForCompletion(agilityExp,
-					Microbot.getClientThread().invoke(() -> Microbot.getClient().getLocalPlayer().getWorldLocation()).getPlane());
+					playerLocation.getPlane());
 
 				if (!completed) {
 					// Timeout during efficient alching - log warning

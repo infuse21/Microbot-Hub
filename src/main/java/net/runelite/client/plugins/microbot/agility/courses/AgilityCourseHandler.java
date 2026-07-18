@@ -33,7 +33,7 @@ public interface AgilityCourseHandler
 
 	default WorldPoint getPlayerWorldLocation()
 	{
-		return Microbot.getClientThread().invoke(() -> Microbot.getClient().getLocalPlayer().getWorldLocation());
+		return Rs2Player.getWorldLocation();
 	}
 
 	default int getClientPlane()
@@ -66,9 +66,18 @@ public interface AgilityCourseHandler
 		return handleWalkToStart(playerWorldLocation);
 	}
 
+	default boolean recoverFromMissingObstacle(WorldPoint playerWorldLocation)
+	{
+		return false;
+	}
+
 	default TileObject getCurrentObstacle()
 	{
 		WorldPoint playerLocation = getPlayerWorldLocation();
+		if (playerLocation == null)
+		{
+			return null;
+		}
 
 		List<AgilityObstacleModel> matchingObstacles = getObstacles().stream()
 			.filter(o -> o.getOperationX().check(playerLocation.getX(), o.getRequiredX()) && o.getOperationY().check(playerLocation.getY(), o.getRequiredY()))
@@ -171,6 +180,10 @@ public interface AgilityCourseHandler
 	default int getCurrentObstacleIndex()
 	{
 		WorldPoint playerLoc = getPlayerWorldLocation();
+		if (playerLoc == null)
+		{
+			return -1;
+		}
 		int playerPlane = getClientPlane();
 
 		if (playerPlane == 0 && playerLoc.distanceTo(getStartPoint()) < 5)
@@ -224,6 +237,11 @@ public interface AgilityCourseHandler
 
 	default boolean handleWalkToStart(WorldPoint playerWorldLocation)
 	{
+		if (playerWorldLocation == null)
+		{
+			return false;
+		}
+
 		if (getClientPlane() != 0)
 		{
 			return false;
